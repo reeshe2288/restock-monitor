@@ -9,16 +9,16 @@
   opacity:0 / 0 尺寸 / 禁用 等方式隐藏）。
 
 有货验证：
-  看到"有货按钮"后，脚本会真的点 ADD TO BAG，再点 PROCEED TO CHECKOUT。
-  如果过程中出现 "...no longer available..." 提示，说明是假有货，不发通知。
+  看到"有货按钮"后，脚本会真的点 ADD TO BAG → SEE MY SHOPPING BAG → PROCEED TO CHECKOUT，
+  三步都成功、进入 Checkout 页、且全程没出现 "...no longer available..." 才报警。
+  任何一步失败都不报警。
   脚本只把商品放进一个一次性的空购物袋，不登录、不填地址、不付款。
 
 退出码：
   0  检查完成（真有货已通知，或确认没货 / 假有货）
   1  两个按钮都看不到 / 页面打不开（已保存截图 screenshot.png）
   3  有货，但通知发送失败
-  4  有货按钮可见、已发通知，但没能走完"加入购物袋→结账"验证（已保存截图，
-     方便核对按钮文字；宁可多提醒一次也不漏掉）
+  4  有货按钮可见，但三步验证没走完，未报警（已保存截图，方便核对按钮文字）
 
 用法：
   python monitor.py                 # 正常检测
@@ -36,8 +36,8 @@
   UNAVAILABLE_TEXT     （可选）加入购物袋/结账后出现就说明其实没货的提示语，
                        默认 "no longer available"（对应梵克雅宝的
                        "Kindly note, the creations in your shopping bag are no longer available"）
-  CHECKOUT_TEXTS       （可选）去结账按钮文字，用 | 分隔，默认
-                       "PROCEED TO CHECKOUT|CHECKOUT|VIEW SHOPPING BAG|VIEW BAG|SHOPPING BAG"
+  BAG_TEXTS            （可选）查看购物袋按钮文字，用 | 分隔，默认 "SEE MY SHOPPING BAG|VIEW BAG|..."
+  CHECKOUT_TEXTS       （可选）去结账按钮文字，用 | 分隔，默认 "PROCEED TO CHECKOUT|PROCEED TO PURCHASE"
   QUIET_HOURS          （可选）免打扰时段，默认 23-9，即手机时间晚 11 点到早 9 点
                        这段时间里有货只发普通通知（不响铃、不穿透静音/睡眠），邮件照发
                        填 off 表示全天都用重要警告
@@ -162,81 +162,119 @@ def visible_text_on_page(page, phrase: str) -> bool:
 
 
 # ----------------------------------------------------------------- 加入购物袋验证
+def _texts(env_name: str, default: str) -> list[str]:
+    raw = os.environ.get(env_name, "").strip() or default
+    return [t.strip() for t in raw.split("|") if t.strip()]
+
+
 def verify_in_cart(page, add_button) -> str:
     """
-    点 ADD TO BAG → 点去结账，看会不会出现"已售罄"提示。
-    返回 "available"（走到结账也没提示，真有货）
-         "unavailable"（出现 no longer available，假有货）
-         "unknown"（流程没走通，无法确认）
+    严格三步验证，全部通过才算真有货：
+      1. 点 ADD TO BAG，没有出现售罄提示
+      2. 点 SEE MY SHOPPING BAG，购物袋里有东西、没有售罄提示
+      3. 点 PROCEED TO CHECKOUT，真的进入 Checkout 页、没有售罄提示
+    返回 "available"   三步都通过 → 报警
+         "unavailable" 某一步出现 no longer available → 不报警
+         "unknown"     某一步没走通 → 不报警（保存截图，方便排查）
     """
     unavailable = os.environ.get("UNAVAILABLE_TEXT", "").strip() or "no longer available"
-    checkout_texts = [
-        t.strip() for t in (
-            os.environ.get("CHECKOUT_TEXTS", "").strip()
-            or "PROCEED TO CHECKOUT|CHECKOUT|VIEW SHOPPING BAG|VIEW BAG|SHOPPING BAG"
-        ).split("|") if t.strip()
-    ]
+    bag_texts = _texts("BAG_TEXTS",
+                       "SEE MY SHOPPING BAG|VIEW MY SHOPPING BAG|VIEW SHOPPING BAG|"
+                       "SEE MY BAG|VIEW MY BAG|VIEW BAG|GO TO SHOPPING BAG")
+    checkout_texts = _texts("CHECKOUT_TEXTS", "PROCEED TO CHECKOUT|PROCEED TO PURCHASE")
+    empty_text = "shopping bag is currently empty"
 
-    def wait_for_message(seconds: int) -> bool:
+    def sold_out() -> bool:
+        return visible_text_on_page(page, unavailable)
+
+    def wait_sold_out(seconds: int) -> bool:
         for _ in range(seconds):
-            if visible_text_on_page(page, unavailable):
+            if sold_out():
                 return True
             page.wait_for_timeout(1000)
         return False
 
-    log("🛍️ 点击 ADD TO BAG 验证是否真的能买")
-    try:
-        add_button.scroll_into_view_if_needed(timeout=5000)
-        add_button.click(timeout=10_000)
-    except Exception as e:
-        log(f"⚠️ 点不了 ADD TO BAG：{e}")
-        return "unknown"
-
-    if wait_for_message(5):
-        log(f"🚫 加入购物袋后出现「{unavailable}」，其实没货")
-        return "unavailable"
-
-    # 最多点 3 次：可能是 购物袋弹窗 → VIEW BAG → PROCEED TO CHECKOUT
-    clicked_checkout = False
-    for hop in range(3):
-        target = None
-        for _ in range(10):  # 每次最多等 10 秒按钮出现
-            for t in checkout_texts:  # 按优先级：先找 PROCEED TO CHECKOUT
-                target = find_visible(page, t, max_y=0)
-                if target:
-                    log(f"➡️ 点击「{t}」")
-                    is_checkout = "CHECKOUT" in t.upper()
-                    break
-            if target or visible_text_on_page(page, unavailable):
-                break
+    def wait_button(texts: list[str], seconds: int):
+        for _ in range(seconds):
+            if sold_out():
+                return "SOLD_OUT", None
+            for t in texts:
+                el = find_visible(page, t, max_y=0)
+                if el:
+                    return t, el
             page.wait_for_timeout(1000)
+        return None, None
 
-        if visible_text_on_page(page, unavailable):
-            log(f"🚫 出现「{unavailable}」，其实没货")
-            return "unavailable"
-        if not target:
-            break
+    def click(el) -> bool:
         try:
-            target.click(timeout=10_000)
+            el.scroll_into_view_if_needed(timeout=5000)
+            el.click(timeout=10_000)
         except Exception as e:
-            log(f"⚠️ 点击失败：{e}")
-            break
+            log(f"   点击失败：{e}")
+            return False
         try:
             page.wait_for_load_state("domcontentloaded", timeout=20_000)
         except Exception:
             pass
-        if wait_for_message(6):
-            log(f"🚫 结账时出现「{unavailable}」，其实没货")
-            return "unavailable"
-        if is_checkout:
-            clicked_checkout = True
-            break
+        return True
 
-    if clicked_checkout:
-        log("✅ 已走到结账页，没有出现售罄提示，确认真有货")
-        return "available"
-    log("⚠️ 没找到去结账的按钮，无法完成验证")
-    return "unknown"
+    # ---- 第 1 步：ADD TO BAG
+    log("① 点击 ADD TO BAG")
+    if not click(add_button):
+        return "unknown"
+    if wait_sold_out(5):
+        log(f"🚫 第 1 步后出现「{unavailable}」，其实没货")
+        return "unavailable"
+
+    # ---- 第 2 步：SEE MY SHOPPING BAG
+    t, el = wait_button(bag_texts, 15)
+    if t == "SOLD_OUT":
+        log(f"🚫 出现「{unavailable}」，其实没货")
+        return "unavailable"
+    if not el:
+        log(f"⚠️ 第 2 步失败：15 秒内没看到查看购物袋按钮（{' / '.join(bag_texts)}）")
+        return "unknown"
+    log(f"② 点击「{t}」")
+    if not click(el):
+        return "unknown"
+    if wait_sold_out(4):
+        log(f"🚫 购物袋里出现「{unavailable}」，其实没货")
+        return "unavailable"
+    if visible_text_on_page(page, empty_text):
+        log("⚠️ 第 2 步失败：购物袋是空的，商品没有加进去")
+        return "unknown"
+
+    # ---- 第 3 步：PROCEED TO CHECKOUT
+    t, el = wait_button(checkout_texts, 15)
+    if t == "SOLD_OUT":
+        log(f"🚫 购物袋里出现「{unavailable}」，其实没货")
+        return "unavailable"
+    if not el:
+        log(f"⚠️ 第 3 步失败：购物袋页没看到结账按钮（{' / '.join(checkout_texts)}）")
+        return "unknown"
+    log(f"③ 点击「{t}」")
+    if not click(el):
+        return "unknown"
+    if wait_sold_out(8):
+        log(f"🚫 结账时出现「{unavailable}」，其实没货")
+        return "unavailable"
+
+    # 确认真的到了 Checkout 页：网址含 checkout，或页面上显示了邮箱输入框
+    on_checkout = "checkout" in page.url.lower()
+    if not on_checkout:
+        for el in page.locator("input[type='email'], input[name*='mail' i], input[id*='mail' i]").all():
+            try:
+                if el.is_visible():
+                    on_checkout = True
+                    break
+            except Exception:
+                continue
+    if not on_checkout:
+        log(f"⚠️ 第 3 步失败：点了结账但没进入 Checkout 页（当前网址 {page.url}）")
+        return "unknown"
+
+    log("✅ 三步全部通过：已加入购物袋、购物袋正常、已进入 Checkout 页，确认真有货")
+    return "available"
 
 
 # ----------------------------------------------------------------- 通知
@@ -306,10 +344,7 @@ def notify_in_stock(url: str, text: str, verified: bool = True) -> bool:
     """有货：Bark + 邮件，两者独立，一个失败不影响另一个。返回是否全部成功。"""
     ok = True
     title = "🚨 补货了！快去买！"
-    if verified:
-        body = "已成功加入购物袋并进入结账，点开立刻下单"
-    else:
-        body = f"「{text}」按钮已出现（未能自动验证结账），点开立刻看看"
+    body = "已加入购物袋并成功进入结账页，点开立刻下单"
     try:
         send_bark(title, body, url)
     except Exception as e:
@@ -317,7 +352,7 @@ def notify_in_stock(url: str, text: str, verified: bool = True) -> bool:
         log(f"❌ Bark 发送失败：{e}")
     try:
         send_email(
-            f"🚨 补货提醒：{text} 已可点击",
+            "🚨 补货提醒：已验证可以结账",
             f"监控的商品现在有货了！\n\n链接：{url}\n\n检测时间：{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC\n",
         )
     except Exception as e:
@@ -391,11 +426,12 @@ def check_stock() -> int:
                 browser.close()
                 return 0  # 假有货，不通知
             if result == "unknown":
+                # 没走完三步：不报警，只保存截图并把这次运行标红，方便排查
                 _screenshot(page)
+                browser.close()
+                return 4
             browser.close()
-            if not notify_in_stock(url, in_text, verified=(result == "available")):
-                return 3
-            return 0 if result == "available" else 4
+            return 0 if notify_in_stock(url, in_text) else 3
 
         if out_of_stock:
             log(f"⏳ 没货：「{out_text}」按钮可见，继续等待")
