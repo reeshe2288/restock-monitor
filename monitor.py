@@ -253,25 +253,36 @@ def verify_in_cart(page, add_button) -> str:
         log(f"⚠️ 第 3 步失败：购物袋页没看到结账按钮（{' / '.join(checkout_texts)}）")
         return "unknown"
     log(f"③ 点击「{t}」")
+    bag_url = page.url
     if not click(el):
         return "unknown"
-    if wait_sold_out(8):
-        log(f"🚫 结账时出现「{unavailable}」，其实没货")
-        return "unavailable"
-
-    # 确认真的到了 Checkout 页：网址含 checkout，或页面上显示了邮箱输入框
-    on_checkout = "checkout" in page.url.lower()
-    if not on_checkout:
+    # 等页面真正离开购物袋页（注意：梵克雅宝购物袋页网址本身就含 /checkout/shopping-bag，
+    # 所以不能只看网址里有没有 checkout）。售罄时会在购物袋页弹出提示框、不跳转。
+    on_checkout = False
+    for _ in range(20):
+        if sold_out():
+            log(f"🚫 点结账后出现「{unavailable}」，其实没货")
+            return "unavailable"
+        url_now = page.url.lower()
+        left_bag = url_now != bag_url.lower() and "shopping-bag" not in url_now
+        email_box = False
         for el in page.locator("input[type='email'], input[name*='mail' i], input[id*='mail' i]").all():
             try:
                 if el.is_visible():
-                    on_checkout = True
+                    email_box = True
                     break
             except Exception:
                 continue
+        if left_bag and ("checkout" in url_now or email_box):
+            on_checkout = True
+            break
+        page.wait_for_timeout(1000)
     if not on_checkout:
-        log(f"⚠️ 第 3 步失败：点了结账但没进入 Checkout 页（当前网址 {page.url}）")
+        log(f"⚠️ 第 3 步失败：点了结账但 20 秒内没进入 Checkout 页（当前网址 {page.url}）")
         return "unknown"
+    if wait_sold_out(5):
+        log(f"🚫 Checkout 页出现「{unavailable}」，其实没货")
+        return "unavailable"
 
     log("✅ 三步全部通过：已加入购物袋、购物袋正常、已进入 Checkout 页，确认真有货")
     return "available"
