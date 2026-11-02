@@ -407,6 +407,15 @@ def check_stock() -> int:
             except Exception:
                 pass  # 有的网站一直有网络请求，没关系
 
+            # 商品页被网站下架时，官网会把链接自动跳到系列页（例如 alhambra.html）。
+            # 这种情况等同于没货：记一笔、正常结束，等商品页恢复后自动继续检测。
+            want = urllib.parse.urlparse(url).path.rstrip("/").split("/")[-1].lower()
+            now_path = urllib.parse.urlparse(page.url).path.lower()
+            if want and want not in now_path:
+                log(f"⏳ 商品页暂时下架：链接被跳转到 {page.url}，当作没货，继续等待")
+                browser.close()
+                return 0
+
             # 每秒检查一次，最多 20 秒。网页常常先显示默认按钮、再用 JS 刷新库存，
             # 所以要求"连续 4 次（约 3 秒）结果不变"才算数，避免误报或漏报。
             in_stock = out_of_stock = None
