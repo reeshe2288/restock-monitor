@@ -1,0 +1,62 @@
+name: Trump Truth Monitor
+
+on:
+  # 主要靠 cron-job.org 每 2 分钟触发（workflow_dispatch）；下面的定时只是备用
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式"
+        required: true
+        default: "check"
+        type: choice
+        options:
+          - check   # 正常检测
+          - test    # 把最新 1 条当新帖推送一次，测试手机/电脑/邮件
+
+# 同一时间只跑一个；排队的只保留最新一个，避免积压和重复提醒
+concurrency:
+  group: truth-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: 下载代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 读取上次记住的最新帖子
+        uses: actions/cache/restore@v4
+        with:
+          path: truth_state.json
+          key: truth-state-${{ github.run_id }}
+          restore-keys: truth-state-
+
+      - name: 检查新帖
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          TRUTH_BARK_KEYS: ${{ secrets.TRUTH_BARK_KEYS }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          QUIET_HOURS: ${{ secrets.QUIET_HOURS }}
+          TRUTH_BARK_LEVEL: ${{ secrets.TRUTH_BARK_LEVEL }}
+          TRUTH_EMAIL: ${{ secrets.TRUTH_EMAIL }}
+          MODE: ${{ github.event.inputs.mode || 'check' }}
+        run: |
+          if [ "$MODE" = "test" ]; then python truth_monitor.py --test; else python truth_monitor.py; fi
+
+      - name: 保存最新帖子记录
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: truth_state.json
+          key: truth-state-${{ github.run_id }}
